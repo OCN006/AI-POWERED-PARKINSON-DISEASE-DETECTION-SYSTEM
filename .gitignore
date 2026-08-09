@@ -1,0 +1,12 @@
+# Virtual Environments
+.venv/
+venv/
+
+# PyTorch Model Weights
+*.pth
+
+# Datasets
+Sleepdata/
+
+# IDE files
+.idea/
