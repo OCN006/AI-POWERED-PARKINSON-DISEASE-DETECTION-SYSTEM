@@ -1,16 +1,19 @@
 import os
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, random_split
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from torch.utils.data import DataLoader
+from main import (
+    BidslabSleepFusionDataset,
+    DualSensorFusionModel,
+    create_subject_level_split,
+    get_device,
+    print_evaluation_metrics,
+)
 
-# Imports the dataset logic and LSTM architecture directly from your main.py file
-from main import BidslabSleepFusionDataset, DualSensorFusionModel
 
 
 def evaluate_model():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Evaluating model on: {device}")
+    device = get_device()
 
     dataset_path = os.path.join(
         "Sleepdata",
@@ -24,14 +27,8 @@ def evaluate_model():
         print("Error: No data found. Check your dataset path.")
         return
 
-    # Recreates the EXACT 80/20 split used during training (Seed 42)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    _, test_ds = random_split(
-        dataset,
-        [train_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    # Recreates the exact subject-level 80/20 split used during training.
+    _, test_ds = create_subject_level_split(dataset)
 
     test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
 
@@ -48,6 +45,7 @@ def evaluate_model():
     model.eval()
     all_preds = []
     all_targets = []
+    all_probabilities = []
 
     print(f"Running predictions on the {len(test_ds)} test epochs...")
     with torch.no_grad():
@@ -60,20 +58,12 @@ def evaluate_model():
 
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.numpy())
-
-    # Calculate and print metrics
-    acc = accuracy_score(all_targets, all_preds)
+            all_probabilities.extend(torch.softmax(outputs, dim=1).cpu().numpy())
 
     print("\n" + "=" * 50)
     print("DETAILED TEST EVALUATION RESULTS")
     print("=" * 50)
-    print(f"Overall Test Accuracy : {acc * 100:.2f}%\n")
-
-    print("Classification Report:")
-    print(classification_report(all_targets, all_preds, zero_division=0))
-
-    print("Confusion Matrix:")
-    print(confusion_matrix(all_targets, all_preds))
+    print_evaluation_metrics(all_targets, all_preds, np.asarray(all_probabilities))
 
 
 if __name__ == "__main__":

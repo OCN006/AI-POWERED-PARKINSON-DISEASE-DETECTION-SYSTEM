@@ -1,15 +1,13 @@
 import os
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# Imports your dataset loader and model architecture from main.py
-from main import BidslabSleepFusionDataset, DualSensorFusionModel
+from main import BidslabSleepFusionDataset, DualSensorFusionModel, get_device, print_evaluation_metrics
 
 
 def evaluate_new_dataset(new_data_folder):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Evaluating model on: {device}")
+    device = get_device()
     print(f"Loading external dataset from: {new_data_folder}")
     print("-" * 50)
 
@@ -31,6 +29,7 @@ def evaluate_new_dataset(new_data_folder):
 
     all_preds = []
     all_targets = []
+    all_probabilities = []
 
     print(f"Running predictions on {len(external_dataset)} new unseen epochs...")
     with torch.no_grad():
@@ -43,20 +42,12 @@ def evaluate_new_dataset(new_data_folder):
 
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.numpy())
-
-    # Calculate final metrics
-    acc = accuracy_score(all_targets, all_preds)
+            all_probabilities.extend(torch.softmax(outputs, dim=1).cpu().numpy())
 
     print("\n" + "=" * 50)
     print("EXTERNAL DATASET EVALUATION RESULTS")
     print("=" * 50)
-    print(f"Overall Accuracy : {acc * 100:.2f}%\n")
-
-    print("Classification Report:")
-    print(classification_report(all_targets, all_preds, zero_division=0))
-
-    print("Confusion Matrix:")
-    print(confusion_matrix(all_targets, all_preds))
+    print_evaluation_metrics(all_targets, all_preds, np.asarray(all_probabilities))
 
 
 if __name__ == "__main__":

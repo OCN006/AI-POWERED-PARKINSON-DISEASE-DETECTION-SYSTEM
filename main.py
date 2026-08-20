@@ -5,8 +5,9 @@ import scipy.io
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-from sklearn.metrics import accuracy_score
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.utils.class_weight import compute_class_weight
 
 
@@ -18,6 +19,7 @@ class BidslabSleepFusionDataset(Dataset):
         self.hr_data = []
         self.motion_data = []
         self.labels = []
+        self.subject_ids = []
 
         print(f"Scanning directory and slicing data into clinical 30-second epochs...")
 
@@ -35,11 +37,14 @@ class BidslabSleepFusionDataset(Dataset):
                                                                 fixed_len)
 
                 if hr_windows is not None and motion_windows is not None:
+                    relative_dir = os.path.relpath(dirpath, root_dir)
+                    subject_id = relative_dir.split(os.sep)[0]
                     for i in range(num_epochs):
                         if 0 <= labels_array[i] < 6:
                             self.hr_data.append(hr_windows[i])
                             self.motion_data.append(motion_windows[i])
                             self.labels.append(torch.tensor(labels_array[i], dtype=torch.long))
+                            self.subject_ids.append(subject_id)
 
         print(f"Successfully loaded {len(self.labels)} individual sleep epochs into memory!")
 
@@ -87,6 +92,44 @@ class BidslabSleepFusionDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.hr_data[idx], self.motion_data[idx], self.labels[idx]
+
+
+def create_subject_level_split(dataset, test_size=0.2, random_state=42):
+    """Split epochs so that no subject contributes to both train and test sets."""
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    train_indices, test_indices = next(
+        splitter.split(np.zeros(len(dataset)), dataset.labels, groups=dataset.subject_ids)
+    )
+    return Subset(dataset, train_indices.tolist()), Subset(dataset, test_indices.tolist())
+
+
+def get_device():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA device: {torch.cuda.get_device_name(device)}")
+    return device
+
+
+def print_evaluation_metrics(targets, predictions, probabilities):
+    class_names = ["Wake", "N1", "N2", "N3", "REM", "Unscored"]
+    accuracy = accuracy_score(targets, predictions)
+
+    print("\n" + "=" * 50)
+    print("FINAL EVALUATION METRICS")
+    print("=" * 50)
+    print(f"Accuracy : {accuracy * 100:.2f}%")
+    print("\nClassification report (precision, recall, F1-score):")
+    print(classification_report(
+        targets, predictions, labels=list(range(6)), target_names=class_names, zero_division=0
+    ))
+    print("Macro ROC-AUC (one-vs-rest):")
+    try:
+        print(f"{roc_auc_score(targets, probabilities, labels=list(range(6)), multi_class='ovr', average='macro'):.4f}")
+    except ValueError as error:
+        print(f"Unavailable: {error}")
+    print("Confusion matrix (rows=true, columns=predicted):")
+    print(confusion_matrix(targets, predictions, labels=list(range(6))))
 
 
 # ==========================================
@@ -160,18 +203,12 @@ def train_and_evaluate():
         print("\nCRITICAL ERROR: No data found.")
         return
 
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_ds, test_ds = random_split(
-        dataset,
-        [train_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    train_ds, test_ds = create_subject_level_split(dataset)
 
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False) if test_size > 0 else None
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False) if len(test_ds) > 0 else None
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device()
     model = DualSensorFusionModel(num_classes=6).to(device)
 
     print("Calculating capped class weights...")
@@ -224,7 +261,7 @@ def train_and_evaluate():
         return
 
     model.eval()
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_probabilities = [], [], []
 
     with torch.no_grad():
         for hr_batch, motion_batch, labels in test_loader:
@@ -232,12 +269,9 @@ def train_and_evaluate():
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.numpy())
+            all_probabilities.extend(torch.softmax(outputs, dim=1).cpu().numpy())
 
-    print("\n" + "=" * 50)
-    print("FINAL EVALUATION METRICS")
-    print("=" * 50)
-    acc = accuracy_score(all_targets, all_preds)
-    print(f"Accuracy : {acc * 100:.2f}%")
+    print_evaluation_metrics(all_targets, all_preds, np.asarray(all_probabilities))
 
     save_path = "bidslab_sleep_model.pth"
     torch.save(model.state_dict(), save_path)

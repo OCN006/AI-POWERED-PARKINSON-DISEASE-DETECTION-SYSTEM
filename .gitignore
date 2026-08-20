@@ -4,6 +4,7 @@ venv/
 
 # PyTorch Model Weights
 *.pth
+!bidslab_sleep_model.pth
 
 # Datasets
 Sleepdata/
