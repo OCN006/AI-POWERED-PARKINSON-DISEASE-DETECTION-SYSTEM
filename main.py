@@ -1,25 +1,34 @@
+import argparse
 import os
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import scipy.io
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, Subset
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 
 # ==========================================
 # 1. EPOCH-BASED DATASET LOADER (Fixed Normalization)
 # ==========================================
 class BidslabSleepFusionDataset(Dataset):
-    def __init__(self, root_dir, fixed_len=400):
+    def __init__(self, root_dir, fixed_len=400, seq_len=5):
         self.hr_data = []
         self.motion_data = []
         self.labels = []
         self.subject_ids = []
+        self.seq_len = seq_len
 
         print(f"Scanning directory and slicing data into clinical 30-second epochs...")
 
@@ -91,7 +100,21 @@ class BidslabSleepFusionDataset(Dataset):
         return windows
 
     def __getitem__(self, idx):
-        return self.hr_data[idx], self.motion_data[idx], self.labels[idx]
+        hr_seq = []
+        motion_seq = []
+        target_subject = self.subject_ids[idx]
+        
+        for i in range(idx - self.seq_len + 1, idx + 1):
+            if i < 0 or self.subject_ids[i] != target_subject:
+                hr_seq.append(torch.zeros_like(self.hr_data[idx]))
+                motion_seq.append(torch.zeros_like(self.motion_data[idx]))
+            else:
+                hr_seq.append(self.hr_data[i])
+                motion_seq.append(self.motion_data[i])
+                
+        hr_seq = torch.stack(hr_seq) 
+        motion_seq = torch.stack(motion_seq)
+        return hr_seq, motion_seq, self.labels[idx]
 
 
 def create_subject_level_split(dataset, test_size=0.2, random_state=42):
@@ -133,37 +156,40 @@ def print_evaluation_metrics(targets, predictions, probabilities):
 
 
 # ==========================================
-# 2. CRNN: CONVOLUTIONAL RECURRENT NETWORK
+# 2. IMPROVED CRNN WITH ATTENTION POOLING
 # ==========================================
 class SensorEncoder(nn.Module):
+    """Three-block 1D-CNN -> BiLSTM -> attention-weighted pooling."""
+
     def __init__(self, in_channels=1, out_dim=64):
         super().__init__()
         self.cnn = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=5, stride=2, padding=2),
+            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(2)
+            nn.GELU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(25),
         )
         self.lstm = nn.LSTM(
-            input_size=64,
-            hidden_size=32,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
+            input_size=64, hidden_size=32, num_layers=1,
+            batch_first=True, bidirectional=True,
         )
+        self.attn = nn.Linear(64, 1)
         self.fc = nn.Linear(64, out_dim)
 
     def forward(self, x):
-        x = self.cnn(x)
-        x = x.permute(0, 2, 1)
-
-        lstm_out, _ = self.lstm(x)
-        out = torch.mean(lstm_out, dim=1)
-        return torch.relu(self.fc(out))
+        x = self.cnn(x)                    # [B, 64, 25]
+        x = x.permute(0, 2, 1)             # [B, 25, 64]
+        lstm_out, _ = self.lstm(x)          # [B, 25, 64]
+        attn_w = torch.softmax(self.attn(lstm_out), dim=1)
+        pooled = (lstm_out * attn_w).sum(dim=1)
+        return torch.relu(self.fc(pooled))
 
 
 class DualSensorFusionModel(nn.Module):
@@ -172,69 +198,151 @@ class DualSensorFusionModel(nn.Module):
         self.hr_encoder = SensorEncoder(out_dim=64)
         self.motion_encoder = SensorEncoder(out_dim=64)
 
+        self.context_gru = nn.GRU(
+            input_size=128, hidden_size=64, num_layers=1, batch_first=True
+        )
+
         self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(64, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(64, num_classes)
         )
 
     def forward(self, hr_x, motion_x):
+        B, S, C, L = hr_x.shape
+        
+        hr_x = hr_x.view(B * S, C, L)
+        motion_x = motion_x.view(B * S, C, L)
+
         hr_features = self.hr_encoder(hr_x)
         motion_features = self.motion_encoder(motion_x)
 
         fused_features = torch.cat((hr_features, motion_features), dim=1)
-        logits = self.classifier(fused_features)
+        fused_features = fused_features.view(B, S, 128)
+        
+        lstm_out, _ = self.context_gru(fused_features)
+        last_out = lstm_out[:, -1, :]
+        
+        logits = self.classifier(last_out)
         return logits
 
 
 # ==========================================
-# 3. TRAINING ENGINE WITH CAPPED WEIGHTS
+# 3. FOCAL LOSS
+# ==========================================
+class FocalLoss(nn.Module):
+    """Focal loss with optional per-class weights and label smoothing."""
+
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(
+            logits, targets, weight=self.weight,
+            reduction="none", label_smoothing=self.label_smoothing,
+        )
+        pt = torch.exp(-ce)
+        return (((1.0 - pt) ** self.gamma) * ce).mean()
+
+
+# ==========================================
+# 4. CLI
+# ==========================================
+def parse_training_args():
+    p = argparse.ArgumentParser(description="Train the six-class sleep staging model.")
+    p.add_argument("--loss-type", choices=["weighted_ce", "focal"], default="focal")
+    p.add_argument("--gamma", type=float, default=2.0)
+    p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--no-balanced-sampling", action="store_true")
+    p.add_argument("--unweighted", action="store_true", help="Disable class weights to maximize raw accuracy.")
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--seq-len", type=int, default=21, help="Number of epochs in the sliding window context.")
+    p.add_argument("--save-path", default="bidslab_sleep_model.pth")
+    return p.parse_args()
+
+
+# ==========================================
+# 5. TRAINING ENGINE
 # ==========================================
 def train_and_evaluate():
+    args = parse_training_args()
+    class_names = ["Wake", "N1", "N2", "N3", "REM", "Unscored"]
+
     dataset_path = os.path.join(
         "Sleepdata",
-        "a-multi-night-instantaneous-heart-rate-and-accelerometry-dataset-with-eeg-sleep-stage-labels-1.0.0"
+        "a-multi-night-instantaneous-heart-rate-and-accelerometry-dataset-with-eeg-sleep-stage-labels-1.0.0",
     )
-
-    dataset = BidslabSleepFusionDataset(root_dir=dataset_path)
-
+    dataset = BidslabSleepFusionDataset(root_dir=dataset_path, seq_len=args.seq_len)
     if len(dataset) == 0:
         print("\nCRITICAL ERROR: No data found.")
         return
 
     train_ds, test_ds = create_subject_level_split(dataset)
+    train_labels = torch.tensor(
+        [dataset.labels[idx].item() for idx in train_ds.indices], dtype=torch.long,
+    )
+    class_counts = torch.bincount(train_labels, minlength=6).float()
+    total = float(class_counts.sum())
 
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False) if len(test_ds) > 0 else None
+    print("\n--- Training class distribution ---")
+    for i, name in enumerate(class_names):
+        n = int(class_counts[i].item())
+        print(f"  {name:>10}: {n:>7}  ({n / total * 100:5.1f}%)")
+
+    # --- Balanced sampling (only balances batch composition) ---
+    if not args.no_balanced_sampling:
+        sw = 1.0 / class_counts[train_labels]
+        sampler = WeightedRandomSampler(sw, num_samples=len(train_ds), replacement=True,
+                                        generator=torch.Generator().manual_seed(42))
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler)
+        print("Balanced sampling: ENABLED")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+        print("Balanced sampling: DISABLED")
+
+    test_loader = (
+        DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+        if len(test_ds) > 0 else None
+    )
 
     device = get_device()
     model = DualSensorFusionModel(num_classes=6).to(device)
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {num_params:,}")
 
-    print("Calculating capped class weights...")
-    train_labels = [train_ds.dataset[idx][2].item() for idx in train_ds.indices]
-    unique_labels = np.unique(train_labels)
-    computed_weights = compute_class_weight('balanced', classes=unique_labels, y=train_labels)
+    # --- Sqrt-inverse class weights, clipped (mild, since sampling already balances) ---
+    if args.unweighted:
+        cw = torch.ones(6).to(device)
+        print("Class weights: UNWEIGHTED (All 1.0) - Accuracy Maximizer Mode")
+    else:
+        cw = torch.sqrt(total / (6.0 * class_counts)).clamp(0.8, 2.5).to(device)
+        print("Class weights (sqrt-inverse, clipped [0.8, 2.5]):")
+        for i, name in enumerate(class_names):
+            print(f"  {name:>10}: {cw[i].item():.4f}")
 
-    # CRITICAL FIX: Cap the weights at 5.0 so the LSTM doesn't destabilize
-    computed_weights = np.clip(computed_weights, 1.0, 5.0)
+    # --- Loss ---
+    if args.loss_type == "focal":
+        criterion = FocalLoss(weight=cw, gamma=args.gamma, label_smoothing=args.label_smoothing).to(device)
+        print(f"Loss: Focal (gamma={args.gamma}, smoothing={args.label_smoothing})")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=cw, label_smoothing=args.label_smoothing)
+        print(f"Loss: Weighted CE (smoothing={args.label_smoothing})")
 
-    full_weights = torch.ones(6, dtype=torch.float32)
-    for cls_idx, weight in zip(unique_labels, computed_weights):
-        if int(cls_idx) < 6:
-            full_weights[int(cls_idx)] = float(weight)
-    full_weights = full_weights.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    criterion = nn.CrossEntropyLoss(weight=full_weights)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    best_macro_f1 = 0.0
+    print(f"\nTraining {args.epochs} epochs on {device}")
+    print("-" * 100)
 
-    epochs = 15  # Increased slightly to give the LSTM time to learn
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    print(f"\nStarting Fixed LSTM Training ({epochs} Epochs) on: {device}")
-    print("-" * 50)
-
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
 
@@ -247,35 +355,53 @@ def train_and_evaluate():
             outputs = model(hr_batch, motion_batch)
             loss = criterion(outputs, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
             total_loss += loss.item()
 
         scheduler.step()
         avg_loss = total_loss / len(train_loader)
-        current_lr = scheduler.get_last_lr()[0]
+        lr_now = scheduler.get_last_lr()[0]
 
-        print(f"Epoch [{epoch:02d}/{epochs:02d}] - Loss: {avg_loss:.4f} (LR: {current_lr:.6f})")
+        # --- Per-class F1 validation ---
+        val_summary = ""
+        if test_loader is not None:
+            model.eval()
+            v_preds, v_true = [], []
+            with torch.no_grad():
+                for hr_b, mot_b, lbl in test_loader:
+                    out = model(hr_b.to(device), mot_b.to(device))
+                    v_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
+                    v_true.extend(lbl.numpy())
+            pcf1 = f1_score(v_true, v_preds, labels=list(range(6)), average=None, zero_division=0)
+            macro = float(np.mean(pcf1))
+            acc = accuracy_score(v_true, v_preds)
+            parts = " ".join(f"{class_names[i][:4]}={pcf1[i]:.3f}" for i in range(6))
+            saved_tag = ""
+            if macro > best_macro_f1:
+                best_macro_f1 = macro
+                torch.save(model.state_dict(), args.save_path)
+                saved_tag = " *BEST*"
+            val_summary = f"  | acc={acc:.3f} macF1={macro:.3f} [{parts}]{saved_tag}"
 
-    if test_loader is None:
-        return
+        print(f"Ep [{epoch:02d}/{args.epochs:02d}] loss={avg_loss:.4f} lr={lr_now:.6f}{val_summary}")
 
-    model.eval()
-    all_preds, all_targets, all_probabilities = [], [], []
+    # --- Reload best checkpoint and final eval ---
+    print(f"\nBest macro F1: {best_macro_f1:.4f}")
+    model.load_state_dict(torch.load(args.save_path, map_location=device, weights_only=True))
 
-    with torch.no_grad():
-        for hr_batch, motion_batch, labels in test_loader:
-            outputs = model(hr_batch.to(device), motion_batch.to(device))
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(labels.numpy())
-            all_probabilities.extend(torch.softmax(outputs, dim=1).cpu().numpy())
+    if test_loader is not None:
+        model.eval()
+        all_preds, all_targets, all_probs = [], [], []
+        with torch.no_grad():
+            for hr_batch, motion_batch, labels in test_loader:
+                outputs = model(hr_batch.to(device), motion_batch.to(device))
+                all_preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
+                all_targets.extend(labels.numpy())
+                all_probs.extend(torch.softmax(outputs, dim=1).cpu().numpy())
+        print_evaluation_metrics(all_targets, all_preds, np.asarray(all_probs))
 
-    print_evaluation_metrics(all_targets, all_preds, np.asarray(all_probabilities))
-
-    save_path = "bidslab_sleep_model.pth"
-    torch.save(model.state_dict(), save_path)
-    print(f"\nModel successfully saved to: {save_path}")
+    print(f"\nBest model saved to: {args.save_path}")
 
 
 if __name__ == "__main__":

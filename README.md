@@ -57,11 +57,20 @@ The trained weights are saved as `bidslab_sleep_model.pth`.
 
 ## Evaluation Metrics
 
-Run detailed evaluation on the deterministic subject-level test partition:
+Run detailed evaluation on the deterministic subject-level test partition. The checkpoint and dataset paths have sensible defaults, but both can be overridden from the command line:
 
 ```bash
-python evaluate.py
+python evaluate.py --checkpoint bidslab_sleep_model.pth \
+	--data-path Sleepdata/a-multi-night-instantaneous-heart-rate-and-accelerometry-dataset-with-eeg-sleep-stage-labels-1.0.0
 ```
+
+On Windows PowerShell, use one line or PowerShell's backtick for continuation:
+
+```powershell
+\.venv\Scripts\python.exe evaluate.py --checkpoint bidslab_sleep_model.pth --data-path "Sleepdata\a-multi-night-instantaneous-heart-rate-and-accelerometry-dataset-with-eeg-sleep-stage-labels-1.0.0" --output evaluation_report.json
+```
+
+Available options are `--checkpoint`, `--data-path`, `--batch-size`, and `--output`. The optional `--output` argument saves the completed metrics as JSON. Missing files, empty datasets, invalid batch sizes, and checkpoint/model shape mismatches produce a clear error message instead of a traceback.
 
 The evaluator reports:
 
@@ -87,6 +96,6 @@ This path is treated as test-only data and is not included in training. The same
 ## Repository Files
 
 - `main.py`: dataset loader, model definition, subject-level training split, training loop, and training-set evaluation.
-- `evaluate.py`: reloads the checkpoint and evaluates the held-out subjects with detailed metrics.
+- `evaluate.py`: CLI evaluator that reloads the checkpoint and evaluates the held-out subjects with detailed metrics and optional JSON output.
 - `evaluate_external.py`: evaluates labeled data from an external folder.
 - `predict.py`: generates a hypnogram for raw heart-rate and motion CSV files without labels.

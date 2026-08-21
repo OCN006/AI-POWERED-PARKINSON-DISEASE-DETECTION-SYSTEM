@@ -44,6 +44,20 @@ def load_and_preprocess_raw_data(csv_path, window_size=400):
     return tensor_data
 
 
+def create_sliding_windows(tensor_data, seq_len=5):
+    num_epochs, C, L = tensor_data.shape
+    windows = []
+    for i in range(num_epochs):
+        seq = []
+        for j in range(i - seq_len + 1, i + 1):
+            if j < 0:
+                seq.append(torch.zeros_like(tensor_data[0]))
+            else:
+                seq.append(tensor_data[j])
+        windows.append(torch.stack(seq))
+    return torch.stack(windows)
+
+
 def generate_hypnogram(hr_path, motion_path, model_path="bidslab_sleep_model.pth"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -56,8 +70,12 @@ def generate_hypnogram(hr_path, motion_path, model_path="bidslab_sleep_model.pth
 
     # Ensure both sensors have the exact same number of 30-second windows
     min_length = min(len(hr_tensor), len(motion_tensor))
-    hr_tensor = hr_tensor[:min_length].to(device)
-    motion_tensor = motion_tensor[:min_length].to(device)
+    hr_tensor = hr_tensor[:min_length]
+    motion_tensor = motion_tensor[:min_length]
+    
+    # Create sequence context windows
+    hr_tensor = create_sliding_windows(hr_tensor, seq_len=21).to(device)
+    motion_tensor = create_sliding_windows(motion_tensor, seq_len=21).to(device)
 
     print(f"Processed {min_length} epochs (approx {min_length * 30 / 60:.1f} minutes of sleep).")
 
