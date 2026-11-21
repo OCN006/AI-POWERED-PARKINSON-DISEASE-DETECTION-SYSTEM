@@ -4,10 +4,14 @@ venv/
 
 # PyTorch Model Weights
 *.pth
-!bidslab_sleep_model.pth
+!**/bidslab_sleep_model.pth
 
 # Datasets
 Sleepdata/
 
 # IDE files
 .idea/
+
+# Python bytecode and cache directories
+__pycache__/
+*.py[cod]
