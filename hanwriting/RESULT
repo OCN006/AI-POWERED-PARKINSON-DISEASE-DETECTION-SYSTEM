@@ -1,0 +1,24 @@
+=== Ensemble result (cbam, 5 folds averaged) ===
+Image: data\Writing_by_a_Parkinson's_disease_patient.png
+Prediction: PARKINSON
+Confidence: 76.3%
+Individual fold votes: ['0.641', '0.847', '0.838', '0.694', '0.793']
+
+
+=== Ensemble result (baseline, 5 folds averaged) ===
+Image: data\Writing_by_a_Parkinson's_disease_patient.png
+Prediction: PARKINSON
+Confidence: 81.9%
+Individual fold votes: ['0.603', '0.930', '0.904', '0.844', '0.811']
+
+=== Ensemble result (baseline, 5 folds averaged) ===
+Image: data\images.jpeg
+Prediction: PARKINSON
+Confidence: 50.9%
+Individual fold votes: ['0.350', '0.749', '0.468', '0.403', '0.577']
+
+=== Ensemble result (cbam, 5 folds averaged) ===
+Image: data\images.jpeg
+Prediction: HEALTHY
+Confidence: 56.5%
+Individual fold votes: ['0.403', '0.436', '0.339', '0.563', '0.433']
